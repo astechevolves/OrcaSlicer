@@ -17,13 +17,7 @@
 #include "MsgDialog.hpp"
 #include "DownloadProgressDialog.hpp"
 #include "slic3r/Utils/BBLNetworkPlugin.hpp"
-#include "wxExtensions.hpp"
 #include "libslic3r/PresetBundle.hpp"
-#include <wx/bitmap.h>
-#include <wx/brush.h>
-#include <wx/colour.h>
-#include <wx/dcmemory.h>
-#include <wx/image.h>
 
 
 #include <algorithm>
@@ -242,38 +236,17 @@ CameraStreamMode MediaPlayCtrl::current_mode() const
     return agent ? agent->get_camera_stream_mode() : CameraStreamMode::none;
 }
 
-namespace {
-
-// The picture shown before a non-Bambu printer's camera plays: the Orca logo on a dark field,
-// drawn from the bundled SVG so no extra image file is needed.
-wxImage orca_idle_image()
+void MediaPlayCtrl::update_idle_image()
 {
-    static wxImage image;
-    if (!image.IsOk()) {
-        const wxSize size(1280, 720);
-        wxBitmap     canvas(size);
-        {
-            wxMemoryDC dc(canvas);
-            dc.SetBackground(wxBrush(wxColour("#262729")));
-            dc.Clear();
-            const wxBitmap logo = create_scaled_bitmap("OrcaSlicer_horizontal_dark", nullptr, 120);
-            if (logo.IsOk())
-                dc.DrawBitmap(logo, (size.x - logo.GetWidth()) / 2, (size.y - logo.GetHeight()) / 2, true);
-        }
-        image = canvas.ConvertToImage();
-    }
-    return image;
+    if (wxGetApp().preset_bundle && wxGetApp().preset_bundle->is_bbl_vendor())
+        m_media_ctrl->SetIdleImage(from_u8(resources_dir() + "/images/live_stream_bambu.png"));
+    else
+        m_media_ctrl->SetIdleImage(from_u8(resources_dir() + "/images/live_stream_default.png"));
 }
-
-} // namespace
 
 void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
 {
-    // Bambu's placeholder for Bambu printers, Orca's for everything else.
-    if (wxGetApp().preset_bundle && !wxGetApp().preset_bundle->is_bbl_vendor())
-        m_media_ctrl->SetIdleImage(orca_idle_image());
-    else
-        m_media_ctrl->SetIdleImage(from_u8(resources_dir() + "/images/live_stream_default.png"));
+    update_idle_image();
 
     const CameraStreamMode mode = current_mode();
     if (mode != m_last_mode) {
@@ -1011,6 +984,8 @@ void MediaPlayCtrl::on_show_hide(wxShowEvent &evt)
     m_failed_retry = 0;
     if (!IsShownOnScreen())
         Stop();
+    else
+        update_idle_image(); // before the first refresh, which waits for the printer to connect
 }
 
 void MediaPlayCtrl::media_proc()

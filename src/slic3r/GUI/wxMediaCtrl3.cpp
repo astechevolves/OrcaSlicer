@@ -58,7 +58,7 @@ wxMediaCtrl3::~wxMediaCtrl3()
     {
         std::unique_lock<std::mutex> lk(m_mutex);
         m_url.reset(new wxURI);
-        m_frame = idle_frame();
+        m_frame = wxImage(m_idle_image);
         m_cond.notify_all();
     }
     m_thread.join();
@@ -95,7 +95,7 @@ void wxMediaCtrl3::Stop()
 {
     std::unique_lock<std::mutex> lk(m_mutex);
     m_url.reset();
-    m_frame = idle_frame();
+    m_frame = wxImage(m_idle_image);
     NotifyStopped();
     m_cond.notify_all();
     Refresh();
@@ -140,7 +140,7 @@ void wxMediaCtrl3::BeginExternalStream()
     m_url.reset();
     m_active_url.reset();
     m_video_size = wxDefaultSize;
-    m_frame = idle_frame();
+    m_frame = wxImage(m_idle_image);
     m_cond.notify_all();
     Refresh();
 }
@@ -152,34 +152,20 @@ void wxMediaCtrl3::EndExternalStream()
     m_url.reset();
     m_active_url.reset();
     m_video_size = wxDefaultSize;
-    m_frame = idle_frame();
+    m_frame = wxImage(m_idle_image);
     m_cond.notify_all();
     Refresh();
 }
 
 void wxMediaCtrl3::SetIdleImage(wxString const &image)
 {
-    if (m_idle_image == image && !m_idle_frame.IsOk())
+    if (m_idle_image == image)
         return;
     m_idle_image = image;
-    m_idle_frame = wxImage();
     if (m_url == nullptr) {
         std::unique_lock<std::mutex> lk(m_mutex);
-        m_frame = idle_frame();
+        m_frame = wxImage(m_idle_image);
         assert(m_frame.IsOk());
-        Refresh();
-    }
-}
-
-void wxMediaCtrl3::SetIdleImage(wxImage const &image)
-{
-    // IsSameAs compares the shared image data, so re-setting the same image costs nothing.
-    if (!image.IsOk() || (m_idle_frame.IsOk() && m_idle_frame.IsSameAs(image)))
-        return;
-    m_idle_frame = image;
-    if (m_url == nullptr) {
-        std::unique_lock<std::mutex> lk(m_mutex);
-        m_frame = idle_frame();
         Refresh();
     }
 }
