@@ -1938,7 +1938,7 @@ void MoonrakerPrinterAgent::run_status_stream(std::string dev_id, std::string ba
                 last_message = std::chrono::steady_clock::now();
                 // A message shows the printer is answering, so the next drop starts the backoff from reconnect_delay
                 retry_count = 0;
-                handle_ws_message(dev_id, beast::buffers_to_string(buffer.data()));
+                handle_ws_message(dev_id, base_url, api_key, beast::buffers_to_string(buffer.data()));
                 // Check if handle_ws_message triggered reconnection request
                 if (ws_reconnect_requested.exchange(false)) {
                     connection_lost = true;
@@ -1999,7 +1999,7 @@ void MoonrakerPrinterAgent::run_status_stream(std::string dev_id, std::string ba
     }
 }
 
-void MoonrakerPrinterAgent::handle_ws_message(const std::string& dev_id, const std::string& payload)
+void MoonrakerPrinterAgent::handle_ws_message(const std::string& dev_id, const std::string& base_url, const std::string& api_key, const std::string& payload)
 {
     auto json = nlohmann::json::parse(payload, nullptr, false);
     if (json.is_discarded()) {
@@ -2070,6 +2070,10 @@ void MoonrakerPrinterAgent::handle_ws_message(const std::string& dev_id, const s
     }
 
     if (updated) {
+        refresh_file_metadata(base_url, api_key);
+    }
+
+    if (updated) {
         const auto now_ms           = steady_now_ms();
         const auto last_dispatch_ms = ws_last_dispatch_ms.load();
 
@@ -2122,6 +2126,73 @@ bool MoonrakerPrinterAgent::refresh_storage(const std::string& base_url, const s
         BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent: storage query failed: " << error;
     }
     return has_storage.exchange(has_free) != has_free;
+}
+
+void MoonrakerPrinterAgent::refresh_file_metadata(const std::string& base_url, const std::string& api_key)
+{
+    std::string filename;
+    {
+        std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+        if (status_cache.contains("print_stats") && status_cache["print_stats"].contains("filename") &&
+            status_cache["print_stats"]["filename"].is_string()) {
+            filename = status_cache["print_stats"]["filename"].get<std::string>();
+        }
+    }
+    if (filename == metadata_filename) {
+        return;
+    }
+    metadata_filename = filename;
+
+    nlohmann::json file_info = nlohmann::json::object();
+    if (!filename.empty()) {
+        nlohmann::json json;
+        std::string    error;
+        const auto     cancelled = [this] { return ws_stop.load(); };
+        if (get_json(join_url(base_url, "/server/files/metadata?filename=" + Http::url_encode(filename)), api_key,
+                     cancelled, json, error) &&
+            json.contains("result") && json["result"].is_object()) {
+            const auto& result = json["result"];
+            if (result.contains("estimated_time") && result["estimated_time"].is_number()) {
+                file_info["estimated_time"] = result["estimated_time"].get<double>();
+            }
+            // Thumbnail paths are relative to the folder holding the G-code file; the largest one is used
+            if (result.contains("thumbnails") && result["thumbnails"].is_array()) {
+                std::string best_path;
+                int         best_area = 0;
+                for (const auto& thumb : result["thumbnails"]) {
+                    if (!thumb.is_object() || !thumb.contains("relative_path") || !thumb["relative_path"].is_string()) {
+                        continue;
+                    }
+                    const int area = thumb.value("width", 0) * thumb.value("height", 0);
+                    if (best_path.empty() || area > best_area) {
+                        best_path = thumb["relative_path"].get<std::string>();
+                        best_area = area;
+                    }
+                }
+                if (!best_path.empty()) {
+                    const auto slash = filename.find_last_of('/');
+                    std::string full = slash == std::string::npos ? best_path : filename.substr(0, slash + 1) + best_path;
+                    std::string encoded;
+                    size_t      start = 0;
+                    while (start <= full.size()) {
+                        const auto end = full.find('/', start);
+                        const auto seg = full.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                        encoded += (start == 0 ? "" : "/") + Http::url_encode(seg);
+                        if (end == std::string::npos) {
+                            break;
+                        }
+                        start = end + 1;
+                    }
+                    file_info["thumbnail_url"] = join_url(base_url, "/server/files/gcodes/" + encoded);
+                }
+            }
+        } else if (!error.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent: file metadata query failed: " << error;
+        }
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+    status_cache["orca_file"] = std::move(file_info);
 }
 
 void MoonrakerPrinterAgent::update_status_cache(const nlohmann::json& updates)
@@ -2289,14 +2360,41 @@ nlohmann::json MoonrakerPrinterAgent::build_print_payload_locked() const
         payload["print"]["mc_percent"] = mc_percent;
     }
 
-    if (status_cache.contains("print_stats") && status_cache["print_stats"].contains("total_duration") &&
-        status_cache["print_stats"].contains("print_duration") && status_cache["print_stats"]["total_duration"].is_number() &&
+    // Remaining time: extrapolate from the file progress once it is meaningful, else use the slicer's estimate.
+    // print_duration counts only time spent printing (not heating or pauses), like the progress it is divided by.
+    if (status_cache.contains("print_stats") && status_cache["print_stats"].contains("print_duration") &&
         status_cache["print_stats"]["print_duration"].is_number()) {
-        const double total   = status_cache["print_stats"]["total_duration"].get<double>();
         const double elapsed = status_cache["print_stats"]["print_duration"].get<double>();
-        if (total > 0.0 && elapsed >= 0.0) {
-            const auto remaining_minutes          = std::max(0, static_cast<int>((total - elapsed) / 60.0));
-            payload["print"]["mc_remaining_time"] = remaining_minutes;
+        double       estimated = 0.0;
+        if (status_cache.contains("orca_file") && status_cache["orca_file"].contains("estimated_time")) {
+            estimated = status_cache["orca_file"]["estimated_time"].get<double>();
+        }
+        double remaining = -1.0;
+        if (mc_percent >= 2 && elapsed > 0.0) {
+            const double progress = status_cache["virtual_sdcard"]["progress"].get<double>();
+            remaining             = elapsed / progress - elapsed;
+        } else if (estimated > 0.0) {
+            remaining = estimated - elapsed;
+        }
+        if (remaining >= 0.0) {
+            payload["print"]["mc_remaining_time"] = static_cast<int>(remaining / 60.0 + 0.5);
+        }
+    }
+
+    if (status_cache.contains("orca_file") && status_cache["orca_file"].contains("thumbnail_url")) {
+        payload["print"]["thumbnail_url"] = status_cache["orca_file"]["thumbnail_url"];
+    }
+
+    // Klipper reports layers via print_stats.info, filled by SET_PRINT_STATS_INFO in the G-code.
+    // total_layer_num stays absent (layer display hidden) when the G-code doesn't set it.
+    if (status_cache.contains("print_stats") && status_cache["print_stats"].contains("info") &&
+        status_cache["print_stats"]["info"].is_object()) {
+        const auto& info = status_cache["print_stats"]["info"];
+        if (info.contains("current_layer") && info["current_layer"].is_number()) {
+            payload["print"]["layer_num"] = info["current_layer"].get<int>();
+        }
+        if (info.contains("total_layer") && info["total_layer"].is_number()) {
+            payload["print"]["total_layer_num"] = info["total_layer"].get<int>();
         }
     }
 

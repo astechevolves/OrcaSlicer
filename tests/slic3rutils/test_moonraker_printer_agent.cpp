@@ -249,6 +249,20 @@ public:
         m_disk_usage = std::move(disk_usage);
     }
 
+    // The status objects the printer reports when the stream subscribes.
+    void set_status(nlohmann::json status)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_status = std::move(status);
+    }
+
+    // The answer to a file metadata query. Null leaves the file unknown to the printer.
+    void set_file_metadata(nlohmann::json metadata)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_metadata = std::move(metadata);
+    }
+
     // The multipart body of the last file upload.
     std::string upload()
     {
@@ -328,8 +342,12 @@ private:
             ws.read(message, ec);
         }
         if (!ec && (m_behavior == Behavior::AnswersPings || m_behavior == Behavior::Chatters || m_behavior == Behavior::HangsUp)) {
-            const std::string status =
-                nlohmann::json{{"jsonrpc", "2.0"}, {"id", 1}, {"result", {{"status", {{"print_stats", {{"state", "standby"}}}}}}}}.dump();
+            nlohmann::json reported;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                reported = m_status;
+            }
+            const std::string status = nlohmann::json{{"jsonrpc", "2.0"}, {"id", 1}, {"result", {{"status", reported}}}}.dump();
             ws.write(net::buffer(status), ec);
         }
         if (ec)
@@ -390,6 +408,12 @@ private:
             }
             response.result(http::status::ok);
             response.body() = nlohmann::json{{"result", result}}.dump();
+        } else if (request.target().substr(0, 32) == "/server/files/metadata?filename=") {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_metadata.is_null()) {
+                response.result(http::status::ok);
+                response.body() = nlohmann::json{{"result", m_metadata}}.dump();
+            }
         } else if (request.target() == "/server/files/upload") {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_upload = request.body();
@@ -489,6 +513,8 @@ private:
     int m_close_frames  = 0;
     bool m_released     = false;
     nlohmann::json m_disk_usage = {{"total", 8e9}, {"used", 2e9}, {"free", 6e9}};
+    nlohmann::json m_status     = {{"print_stats", {{"state", "standby"}}}};
+    nlohmann::json m_metadata;
     std::string m_upload;
     std::string m_script;
 };
@@ -784,6 +810,112 @@ TEST_CASE("Status reports tell the send dialog whether the gcodes storage has fr
     CHECK(print.at("sdcard") == has_storage);
     CHECK(((print.at("home_flag").get<int>() >> 8) & 0x3) == (has_storage ? DevStorage::HAS_SDCARD_NORMAL : DevStorage::NO_SDCARD));
     CHECK(f.stops_within(3s));
+}
+
+namespace {
+// The print object of the first status report a printer running `print_stats` and `virtual_sdcard` sends.
+nlohmann::json first_print_report(const nlohmann::json& status, const nlohmann::json& file_metadata = nullptr)
+{
+    std::promise<std::string> first_report;
+    std::once_flag reported;
+    StreamFixture f(Behavior::AnswersPings);
+    f.printer.set_status(status);
+    f.printer.set_file_metadata(file_metadata);
+    f.agent.set_on_local_message_fn([&](std::string, std::string payload) {
+        std::call_once(reported, [&] { first_report.set_value(payload); });
+    });
+    f.start();
+
+    auto report = first_report.get_future();
+    REQUIRE(report.wait_for(5s) == std::future_status::ready);
+    return nlohmann::json::parse(report.get()).at("print");
+}
+} // namespace
+
+TEST_CASE("Status reports carry the layer the print has reached", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    const nlohmann::json info = {{"current_layer", 322}, {"total_layer", 600}};
+    const nlohmann::json print = first_print_report({{"print_stats", {{"state", "printing"}, {"info", info}}}});
+    CHECK(print.at("layer_num") == 322);
+    CHECK(print.at("total_layer_num") == 600);
+}
+
+TEST_CASE("Status reports leave the layer out when the G-code does not report one", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    // Klipper reports null layers until SET_PRINT_STATS_INFO runs
+    const nlohmann::json info = {{"current_layer", nullptr}, {"total_layer", nullptr}};
+    const nlohmann::json print = first_print_report({{"print_stats", {{"state", "printing"}, {"info", info}}}});
+    CHECK_FALSE(print.contains("layer_num"));
+    CHECK_FALSE(print.contains("total_layer_num"));
+}
+
+TEST_CASE("Status reports estimate the remaining time from the print's progress", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    // total_duration counts heating and pauses, so it must not be what the remaining time is derived from.
+    // A tenth of the file taking 10 minutes of printing leaves 90 minutes, whatever the slicer estimated.
+    const nlohmann::json print = first_print_report({{"print_stats", {{"state", "printing"}, {"print_duration", 600.0}, {"total_duration", 5000.0}}},
+                                                     {"virtual_sdcard", {{"progress", 0.1}}}},
+                                                    {{"estimated_time", 1000.0}});
+    CHECK(print.at("mc_remaining_time") == 90);
+}
+
+TEST_CASE("Status reports fall back to the slicer's estimate before the progress means anything", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    const nlohmann::json print = first_print_report({{"print_stats", {{"state", "printing"}, {"filename", "Part.gcode"}, {"print_duration", 600.0}}},
+                                                     {"virtual_sdcard", {{"progress", 0.005}}}},
+                                                    {{"estimated_time", 7200.0}});
+    CHECK(print.at("mc_remaining_time") == 110);
+}
+
+TEST_CASE("Status reports leave the remaining time out when nothing can tell it", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    const nlohmann::json print = first_print_report({{"print_stats", {{"state", "printing"}, {"print_duration", 30.0}}},
+                                                     {"virtual_sdcard", {{"progress", 0.0}}}});
+    CHECK_FALSE(print.contains("mc_remaining_time"));
+}
+
+TEST_CASE("Status reports point at the printed file's largest thumbnail", "[MoonrakerPrinterAgent][StatusStream]")
+{
+    const nlohmann::json thumbnails = nlohmann::json::array({
+        {{"width", 32}, {"height", 32}, {"relative_path", ".thumbs/Part-32x32.png"}},
+        {{"width", 300}, {"height", 300}, {"relative_path", ".thumbs/Part-300x300.png"}},
+    });
+    const nlohmann::json status = {{"print_stats", {{"state", "printing"}, {"filename", "sub dir/Part.gcode"}}}};
+
+    SECTION("a printer that stores thumbnails")
+    {
+        std::string base_url;
+        {
+            std::promise<std::string> first_report;
+            std::once_flag reported;
+            StreamFixture f(Behavior::AnswersPings);
+            f.printer.set_status(status);
+            f.printer.set_file_metadata({{"thumbnails", thumbnails}});
+            f.agent.set_on_local_message_fn([&](std::string, std::string payload) {
+                std::call_once(reported, [&] { first_report.set_value(payload); });
+            });
+            f.start();
+            base_url = f.printer.base_url();
+
+            auto report = first_report.get_future();
+            REQUIRE(report.wait_for(5s) == std::future_status::ready);
+            const nlohmann::json print = nlohmann::json::parse(report.get()).at("print");
+            // The path is relative to the G-code's folder, and each segment is escaped on its own
+            CHECK(print.at("thumbnail_url") == base_url + "/server/files/gcodes/sub%20dir/.thumbs/Part-300x300.png");
+        }
+    }
+
+    SECTION("a file without thumbnails")
+    {
+        const nlohmann::json print = first_print_report(status, {{"estimated_time", 100.0}});
+        CHECK_FALSE(print.contains("thumbnail_url"));
+    }
+
+    SECTION("a file the printer has no metadata for")
+    {
+        const nlohmann::json print = first_print_report(status);
+        CHECK_FALSE(print.contains("thumbnail_url"));
+    }
 }
 
 TEST_CASE("The status stream keeps re-reading the printer's free space", "[MoonrakerPrinterAgent][StatusStream]")

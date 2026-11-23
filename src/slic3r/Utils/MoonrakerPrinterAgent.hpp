@@ -185,12 +185,14 @@ private:
     // Joins a stream stopped from its own callback, so a new stream can start without waiting on it under connect_mutex
     void join_stopped_status_stream();
     void run_status_stream(std::string dev_id, std::string base_url, std::string api_key, StatusStreamTimings timings);
-    void handle_ws_message(const std::string& dev_id, const std::string& payload);
+    void handle_ws_message(const std::string& dev_id, const std::string& base_url, const std::string& api_key, const std::string& payload);
     void send_heartbeat_if_due(const std::string& dev_id, std::chrono::milliseconds interval);
     void dispatch_status(const std::string& dev_id);
     // Re-reads whether the gcodes root has free space, and returns whether the answer changed
     bool refresh_storage(const std::string& base_url, const std::string& api_key);
     void update_status_cache(const nlohmann::json& updates);
+    // Looks up the running file's slicer estimate and thumbnail once per file name, on the status stream thread
+    void refresh_file_metadata(const std::string& base_url, const std::string& api_key);
     nlohmann::json build_print_payload_locked() const;
 
     // Print control helpers
@@ -233,6 +235,7 @@ private:
 
     mutable std::recursive_mutex payload_mutex;
     nlohmann::json     status_cache;
+    std::string        metadata_filename; // File refresh_file_metadata last looked up; only the status stream thread touches it
 
     std::atomic<int>       next_jsonrpc_id{1};
     std::set<std::string>  available_objects;  // Track for feature detection
